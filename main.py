@@ -143,6 +143,8 @@ app.add_middleware(
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
+    if "server" in response.headers:
+        del response.headers["server"]
     response.headers["Server"] = "Satoshi"
     response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     response.headers["X-Content-Type-Options"] = "nosniff"

@@ -81,19 +81,24 @@ if evm_private_key:
     facilitator.register_extension(BAZAAR)
     print("Extensions: eip2612GasSponsoring, erc20ApprovalGasSponsoring, bazaar")
 
-    # Additional EVM mainnets (same key, different RPCs)
+    # Additional EVM mainnets — only register if env var explicitly enables them.
+    # Each chain needs funded gas (ETH) in the facilitator wallet to settle.
+    # Set ENABLE_POLYGON=1, ENABLE_ARBITRUM=1, ENABLE_OPTIMISM=1 to activate.
     extra_chains = {
-        "eip155:137": ("Polygon", os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")),
-        "eip155:42161": ("Arbitrum", os.environ.get("ARBITRUM_RPC_URL", "https://arb1.arbitrum.io/rpc")),
-        "eip155:10": ("Optimism", os.environ.get("OPTIMISM_RPC_URL", "https://mainnet.optimism.io")),
+        "eip155:137": ("Polygon", "POLYGON_RPC_URL", "https://polygon.llamarpc.com", "ENABLE_POLYGON"),
+        "eip155:42161": ("Arbitrum", "ARBITRUM_RPC_URL", "https://arb1.arbitrum.io/rpc", "ENABLE_ARBITRUM"),
+        "eip155:10": ("Optimism", "OPTIMISM_RPC_URL", "https://mainnet.optimism.io", "ENABLE_OPTIMISM"),
     }
-    for chain_id, (name, rpc_url) in extra_chains.items():
-        try:
-            signer = FacilitatorWeb3Signer(private_key=evm_private_key, rpc_url=rpc_url)
-            facilitator.register([chain_id], ExactEvmScheme(signer, config))
-            print(f"{name} ({chain_id}) registered")
-        except Exception as e:
-            print(f"{name} ({chain_id}) failed: {e}")
+    for chain_id, (name, rpc_env, rpc_default, enable_env) in extra_chains.items():
+        if os.environ.get(enable_env):
+            try:
+                signer = FacilitatorWeb3Signer(private_key=evm_private_key, rpc_url=os.environ.get(rpc_env, rpc_default))
+                facilitator.register([chain_id], ExactEvmScheme(signer, config))
+                print(f"{name} ({chain_id}) registered")
+            except Exception as e:
+                print(f"{name} ({chain_id}) failed: {e}")
+        else:
+            print(f"{name} ({chain_id}) skipped — set {enable_env}=1 and fund gas to enable")
 
     # Base Sepolia testnet (same key, different RPC)
     evm_testnet_signer = FacilitatorWeb3Signer(

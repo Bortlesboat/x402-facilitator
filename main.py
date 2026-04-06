@@ -76,6 +76,20 @@ if evm_private_key:
     facilitator.register_extension(erc20_ext)
     print("Gas sponsoring: eip2612 + erc20Approval registered")
 
+    # Additional EVM mainnets (same key, different RPCs)
+    extra_chains = {
+        "eip155:137": ("Polygon", os.environ.get("POLYGON_RPC_URL", "https://polygon-rpc.com")),
+        "eip155:42161": ("Arbitrum", os.environ.get("ARBITRUM_RPC_URL", "https://arb1.arbitrum.io/rpc")),
+        "eip155:10": ("Optimism", os.environ.get("OPTIMISM_RPC_URL", "https://mainnet.optimism.io")),
+    }
+    for chain_id, (name, rpc_url) in extra_chains.items():
+        try:
+            signer = FacilitatorWeb3Signer(private_key=evm_private_key, rpc_url=rpc_url)
+            facilitator.register([chain_id], ExactEvmScheme(signer, config))
+            print(f"{name} ({chain_id}) registered")
+        except Exception as e:
+            print(f"{name} ({chain_id}) failed: {e}")
+
     # Base Sepolia testnet (same key, different RPC)
     evm_testnet_signer = FacilitatorWeb3Signer(
         private_key=evm_private_key,
@@ -107,8 +121,8 @@ class PaymentRequest(BaseModel):
 
 app = FastAPI(
     title="Satoshi x402 Facilitator",
-    description="Verifies and settles x402 payments on Base + Solana (mainnet + testnet)",
-    version="1.2.0",
+    description="Multi-chain x402 facilitator: Base, Polygon, Arbitrum, Optimism, Solana + testnets. Gas sponsoring enabled.",
+    version="1.3.0",
 )
 
 app.add_middleware(

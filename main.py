@@ -1,17 +1,20 @@
 """Satoshi x402 Facilitator.
 
-Multi-network facilitator: Base + Solana (mainnet + testnet).
-Verifies and settles USDC payments on-chain via the x402 protocol.
+Multi-chain facilitator: Base, Polygon, Arbitrum, Optimism, Solana + testnets.
+Gas sponsoring + bazaar extensions. x402 v1 + v2 support.
 
 Run with: uvicorn main:app --host 0.0.0.0 --port 4022
 """
 
+import hashlib
+import json
 import os
 import sys
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from x402 import x402Facilitator
@@ -22,6 +25,7 @@ from x402.extensions.erc20_approval_gas_sponsoring import (
     Erc20ApprovalFacilitatorExtension,
     WriteContractCall,
 )
+from x402.extensions.bazaar import BAZAAR
 
 load_dotenv()
 
@@ -74,7 +78,8 @@ if evm_private_key:
 
     erc20_ext = Erc20ApprovalFacilitatorExtension(signer=Web3BatchSigner(evm_mainnet_signer))
     facilitator.register_extension(erc20_ext)
-    print("Gas sponsoring: eip2612 + erc20Approval registered")
+    facilitator.register_extension(BAZAAR)
+    print("Extensions: eip2612GasSponsoring, erc20ApprovalGasSponsoring, bazaar")
 
     # Additional EVM mainnets (same key, different RPCs)
     extra_chains = {
@@ -121,8 +126,10 @@ class PaymentRequest(BaseModel):
 
 app = FastAPI(
     title="Satoshi x402 Facilitator",
-    description="Multi-chain x402 facilitator: Base, Polygon, Arbitrum, Optimism, Solana + testnets. Gas sponsoring enabled.",
-    version="1.3.0",
+    description="Multi-chain x402 facilitator: Base, Polygon, Arbitrum, Optimism, Solana + testnets. Gas sponsoring + bazaar.",
+    version="1.4.0",
+    docs_url="/docs",
+    redoc_url=None,
 )
 
 app.add_middleware(
@@ -131,6 +138,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["Server"] = "Satoshi"
+    response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 @app.post("/verify")
@@ -159,19 +175,36 @@ async def settle(request: PaymentRequest):
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+_supported_cache: dict | None = None
+_supported_etag: str | None = None
+
+
 @app.get("/supported")
-async def supported():
-    response = facilitator.get_supported()
-    return {
-        "kinds": [k.model_dump(by_alias=True, exclude_none=True) for k in response.kinds],
-        "extensions": response.extensions,
-        "signers": response.signers,
-    }
+async def supported(request: Request):
+    global _supported_cache, _supported_etag
+    if _supported_cache is None:
+        response = facilitator.get_supported()
+        _supported_cache = {
+            "kinds": [k.model_dump(by_alias=True, exclude_none=True) for k in response.kinds],
+            "extensions": response.extensions,
+            "signers": response.signers,
+        }
+        _supported_etag = hashlib.md5(json.dumps(_supported_cache, sort_keys=True).encode()).hexdigest()
+
+    # ETag support — clients can cache and use conditional GET
+    if_none_match = request.headers.get("if-none-match")
+    if if_none_match and if_none_match.strip('"') == _supported_etag:
+        return JSONResponse(status_code=304, content=None)
+
+    return JSONResponse(
+        content=_supported_cache,
+        headers={"ETag": f'"{_supported_etag}"', "Cache-Control": "public, max-age=300"},
+    )
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "version": "1.4.0"}
 
 
 if __name__ == "__main__":

@@ -1,0 +1,14 @@
+.env
+*.pem
+*.key
+__pycache__/
+*.pyc
+
+# Farm scripts contain private keys — NEVER commit
+farm*.py
+volume_farm*.py
+batch_payments.py
+fund_and_test.py
+bridge_to_base.py
+check_wallets.py
+*.log

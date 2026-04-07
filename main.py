@@ -9,10 +9,13 @@ Run with: uvicorn main:app --host 0.0.0.0 --port 4022
 import hashlib
 import json
 import os
+import sqlite3
 import sys
+import time
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -30,6 +33,47 @@ from x402.extensions.bazaar import BAZAAR
 load_dotenv()
 
 PORT = int(os.environ.get("PORT", "4022"))
+
+# --- Settlement history (SQLite) ---
+DB_PATH = Path(os.environ.get("SETTLEMENT_DB", "settlements.db"))
+
+def _init_db():
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS settlements (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            tx_hash TEXT NOT NULL,
+            pay_to TEXT NOT NULL,
+            amount TEXT NOT NULL,
+            network TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'settled',
+            created_at REAL NOT NULL
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_pay_to ON settlements(pay_to)")
+    conn.commit()
+    conn.close()
+
+_init_db()
+
+def record_settlement(tx_hash: str, pay_to: str, amount: str, network: str, status: str = "settled"):
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.execute(
+        "INSERT INTO settlements (tx_hash, pay_to, amount, network, status, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+        (tx_hash, pay_to, amount, network, status, time.time()),
+    )
+    conn.commit()
+    conn.close()
+
+# --- API key bypass ---
+# Keys file: JSON mapping key -> {"merchant": "0x...", "note": "..."}
+API_KEYS_FILE = os.environ.get("API_KEYS_FILE", "api_keys.json")
+
+def _load_api_keys() -> dict:
+    if os.path.exists(API_KEYS_FILE):
+        with open(API_KEYS_FILE) as f:
+            return json.load(f)
+    return {}
 
 evm_private_key = os.environ.get("EVM_PRIVATE_KEY")
 svm_private_key = os.environ.get("SVM_PRIVATE_KEY")
@@ -132,7 +176,7 @@ class PaymentRequest(BaseModel):
 app = FastAPI(
     title="Satoshi x402 Facilitator",
     description="Multi-chain x402 facilitator: Base, Polygon, Arbitrum, Optimism, Solana + testnets. Gas sponsoring + bazaar.",
-    version="1.4.0",
+    version="1.6.0",
     docs_url="/docs",
     redoc_url=None,
 )
@@ -177,7 +221,17 @@ async def settle(request: PaymentRequest):
         payload = parse_payment_payload(request.paymentPayload)
         requirements = PaymentRequirements.model_validate(request.paymentRequirements)
         response = await facilitator.settle(payload, requirements)
-        return response.model_dump(by_alias=True, exclude_none=True)
+        result = response.model_dump(by_alias=True, exclude_none=True)
+
+        # Record settlement for history
+        tx_hash = result.get("transaction", "") or result.get("txHash", "")
+        pay_to = request.paymentRequirements.get("payTo", "")
+        amount = str(request.paymentRequirements.get("maxAmountRequired", ""))
+        network = request.paymentRequirements.get("network", "")
+        if tx_hash:
+            record_settlement(tx_hash, pay_to, amount, network)
+
+        return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
@@ -209,9 +263,187 @@ async def supported(request: Request):
     )
 
 
+@app.get("/settlements/{pay_to}")
+async def get_settlements(
+    pay_to: str,
+    limit: int = Query(default=50, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    """Get settlement history for a merchant address."""
+    conn = sqlite3.connect(str(DB_PATH))
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        "SELECT tx_hash, pay_to, amount, network, status, created_at FROM settlements WHERE pay_to = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        (pay_to, limit, offset),
+    ).fetchall()
+    total = conn.execute("SELECT COUNT(*) FROM settlements WHERE pay_to = ?", (pay_to,)).fetchone()[0]
+    conn.close()
+    return {
+        "settlements": [dict(r) for r in rows],
+        "total": total,
+        "limit": limit,
+        "offset": offset,
+    }
+
+
+@app.get("/settlements/{pay_to}/stats")
+async def get_settlement_stats(pay_to: str):
+    """Get aggregate stats for a merchant address."""
+    conn = sqlite3.connect(str(DB_PATH))
+    row = conn.execute(
+        "SELECT COUNT(*) as count, COALESCE(SUM(CAST(amount AS REAL)), 0) as total_amount FROM settlements WHERE pay_to = ? AND status = 'settled'",
+        (pay_to,),
+    ).fetchone()
+    conn.close()
+    return {"pay_to": pay_to, "total_settlements": row[0], "total_amount": row[1]}
+
+
+@app.post("/verify-key")
+async def verify_api_key(request: Request):
+    """Check if an API key is valid. Returns the associated merchant if so.
+
+    Sellers can use this to bypass the 402 flow for key-holding clients:
+    check Authorization header -> if valid key, return 200 directly.
+    """
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing Bearer token")
+    key = auth[7:]
+    keys = _load_api_keys()
+    if key not in keys:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return {"valid": True, "merchant": keys[key].get("merchant", ""), "note": keys[key].get("note", "")}
+
+
+@app.get("/discovery/resources")
+async def discovery():
+    """Bazaar-compatible discovery endpoint. Lists x402-payable resources available through this facilitator."""
+    return {
+        "facilitator": "Satoshi",
+        "url": "https://facilitator.bitcoinsapi.com",
+        "version": "1.6.0",
+        "resources": [
+            {
+                "url": "https://bitcoinsapi.com/api/v1/ai/explain-tx",
+                "method": "POST",
+                "description": "AI-powered Bitcoin transaction explainer",
+                "price": "0.01",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/ai/explain-block",
+                "method": "POST",
+                "description": "AI-powered Bitcoin block analysis",
+                "price": "0.01",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/ai/fee-advice",
+                "method": "GET",
+                "description": "AI fee optimization recommendation",
+                "price": "0.01",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/ai/chat",
+                "method": "POST",
+                "description": "Bitcoin knowledge chatbot",
+                "price": "0.01",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/broadcast",
+                "method": "POST",
+                "description": "Broadcast a signed Bitcoin transaction",
+                "price": "0.01",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/mining/nextblock",
+                "method": "GET",
+                "description": "Next block prediction with fee analysis",
+                "price": "0.01",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/fees/observatory/scoreboard",
+                "method": "GET",
+                "description": "Fee estimator accuracy scoreboard",
+                "price": "0.005",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/fees/observatory/block-stats",
+                "method": "GET",
+                "description": "Per-block fee statistics",
+                "price": "0.005",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/fees/observatory/estimates",
+                "method": "GET",
+                "description": "Fee estimate history from multiple sources",
+                "price": "0.005",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+            {
+                "url": "https://bitcoinsapi.com/api/v1/fees/landscape",
+                "method": "GET",
+                "description": "Complete fee landscape analysis",
+                "price": "0.005",
+                "currency": "USDC",
+                "network": "eip155:8453",
+            },
+        ],
+    }
+
+
+@app.get("/llms.txt", response_class=JSONResponse)
+async def llms_txt():
+    """Machine-readable facilitator description for AI agents."""
+    return JSONResponse(
+        content={
+            "name": "Satoshi x402 Facilitator",
+            "description": "Multi-chain x402 payment facilitator supporting Base, Polygon, Arbitrum, Optimism, Solana + testnets. Verifies and settles USDC micropayments for API access.",
+            "url": "https://facilitator.bitcoinsapi.com",
+            "protocol": "x402",
+            "supported_networks": ["eip155:8453", "eip155:84532", "solana:5eykt4UsFv8P8NJdTREpY1vzqKqZKvdp", "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1"],
+            "currency": "USDC",
+            "extensions": ["eip2612GasSponsoring", "erc20ApprovalGasSponsoring", "bazaar"],
+            "endpoints": {
+                "verify": "POST /verify",
+                "settle": "POST /settle",
+                "supported": "GET /supported",
+                "discovery": "GET /discovery/resources",
+                "settlements": "GET /settlements/{payTo}",
+                "stats": "GET /settlements/{payTo}/stats",
+                "health": "GET /health",
+            },
+            "merchants": [
+                {
+                    "name": "Satoshi API",
+                    "url": "https://bitcoinsapi.com",
+                    "description": "Bitcoin fee intelligence API for AI agents",
+                    "paid_endpoints": 10,
+                }
+            ],
+        },
+        media_type="application/json",
+    )
+
+
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": "1.4.0"}
+    return {"status": "ok", "version": "1.6.0"}
 
 
 if __name__ == "__main__":

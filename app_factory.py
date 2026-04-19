@@ -72,7 +72,7 @@ def create_app(
     @app.post("/verify")
     async def verify(request: PaymentRequest):
         requirements = request.paymentRequirements
-        resource = requirements.get("resource", "")
+        resource = requirements.get("resource") or requirements.get("extra", {}).get("resourceUrl", "")
         network = requirements.get("network", "")
         pay_to = requirements.get("payTo", "")
         store.record_event("verify_attempt", resource=resource, network=network, pay_to=pay_to, status="pending")
@@ -103,7 +103,7 @@ def create_app(
     @app.post("/settle")
     async def settle(request: PaymentRequest):
         requirements = request.paymentRequirements
-        resource = requirements.get("resource", "")
+        resource = requirements.get("resource") or requirements.get("extra", {}).get("resourceUrl", "")
         network = requirements.get("network", "")
         pay_to = requirements.get("payTo", "")
         amount = str(requirements.get("maxAmountRequired", requirements.get("amount", "")))

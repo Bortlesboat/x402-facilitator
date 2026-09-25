@@ -1,8 +1,8 @@
 # Satoshi x402 Facilitator
 
-Satoshi x402 Facilitator is the payment facilitator used by Satoshi API for x402 machine-payment flows. It exposes verification, settlement, discovery, health, status, settlement-history, and observability endpoints for paid Bitcoin API resources.
+Satoshi x402 Facilitator is a self-hostable Python service for x402 machine-payment flows. It exposes verification, settlement, discovery, health, status, settlement-history, and observability endpoints for paid API resources.
 
-Public service: https://facilitator.bitcoinsapi.com
+The former public service at `facilitator.bitcoinsapi.com` is paused. Configure and operate your own deployment before pointing a client at this service. The repository remains available for local development and testing.
 
 ## What It Provides
 
